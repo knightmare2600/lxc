@@ -10,7 +10,8 @@
 # xx xxx xxxx  Rosco Nap   Initial Version Git: https://github.com/cloudrkt/lxdbackup   #
 # 14 Dec 2018  knightmare  Updated with ISO date format YYYY-MM-DD-HH:MM                #
 # 19 Dec 2018  knightmare  Use current MAC & IP Address of container in backup name,    #
-#                          flesh ot script, add more checks, help output, etc.          #
+#                          flesh out script, add more checks, help output, etc.         #
+# 20 Dec 2018  knightmare  Fix output, make code more modular, remove redundnat code    #
 #                                                                                       #
 #---------------------------------------------------------------------------------------#
 #                        How to restore MAC Address & IP Address                        #
@@ -43,13 +44,34 @@ function help {
   exit 1
   }
 
-## TODO: do a getopts for command line parsing
+## If user gives -h, --help or no parameters, print help and exit
+PARAMETERS=$#
+
+while getopts ":nsh" PARAMETERS; do
+  case $PARAMETERS in
+    n) ## if command line option -c is given, we compile only ###
+      LXCCONTAINER="$1"
+    ;;
+    s)
+      echo different virtual network capability not implemented yet
+      exit 0
+    ;;
+    *) ## any other parameters will always display help
+       help
+       exit 0
+    ;;
+  esac
+done
+
+## User ran the script without parameters, print help
 if [ "$#" -ne 1 ]; then
   help
 fi
 
-## Cleanup when exiting unclean
-trap "cleanup; echo 'Unclean exit'" INT SIGHUP SIGINT SIGTERM
+exit 0
+
+## Clean up when exiting unclean
+trap "clean up; echo 'Unclean exit'" INT SIGHUP SIGINT SIGTERM
 
 ## Pre-flight checks. If the binaries don't exist, we're not backing anything up
 for binary in date logger lxc rclone; do
@@ -61,27 +83,21 @@ location=`which "$binary"`
   fi
 done
 
-## TODO: Check virtual bridge file exists, and add it as command line option
-## only works if the container is booted, so be aware of that too
+## Check virtual bridge file exists, and add it as command line option. The MAC
+## & IP checks only work if the container is booted, so be aware of that too.
+if [ ! -f /var/lib/lxd/networks/lxdbr0/dnsmasq.leases ]; then
+  echo 'virtual bridge file /var/lib/lxd/networks/lxdbr0/dnsmasq.leases does not exist, cannot determine MAC or IP Address'
+  lecho 'virtual bridge file /var/lib/lxd/networks/lxdbr0/dnsmasq.leases does not exist, cannot determine MAC or IP Address'
+  exit 0
+fi
 
 ## Default behaviour
-LXCCONTAINER="$1"
 BACKUPDATE=$(date +"%Y-%m-%d_%H-%M")
-CURRENTIP=$(grep mactest /var/lib/lxd/networks/lxdbr0/dnsmasq.leases | awk '{ print $3 }' | tr '.' '_')
+CURRENTMAC=$(grep "$LXCCONTAINER" /var/lib/lxd/networks/lxdbr0/dnsmasq.leases | awk '{ print $2 }' | tr ':' '-')
+CURRENTIP=$(grep "$LXCCONTAINER" /var/lib/lxd/networks/lxdbr0/dnsmasq.leases | awk '{ print $3 }' | tr '.' '_')
 
 ## Debug output
-##echo Container "$1" with MAC: "$CURRENTMAC" is currnetly on IP address: "$CURRENTIP"
-
-## Check if which is finding the executables to continue.
-if [ -z "$LXC" ]; then
-  echo "LXC command NOT found?";
-  exit 1 ;
-fi
-
-if [ -z "$RCLONE" ]; then
-  echo "RCLONE command NOT found";
-  exit 1 ;
-fi
+##echo Container "$1" with MAC: "$CURRENTMAC" is currently on IP address: "$CURRENTIP"
 
 ## Functions
 lecho () {
@@ -93,32 +109,32 @@ lecho () {
 ## Checking backupdate
 check_backupdate () {
   if [ -z "$BACKUPDATE" ]; then
-    lecho "Could not determine backupdate: $BACKUPDATE"
+    lecho "Could not determine backup date: $BACKUPDATE"
     return 1
   fi
   }
 
-## Cleanup the LXC snapshots
+## Clean up the LXC snapshots
 cleanup_snapshot () {
   check_backupdate
   if $LXC info $LXCCONTAINER|grep -q $BACKUPDATE; then
     if $LXC delete $LXCCONTAINER/$BACKUPDATE; then
-      lecho "Cleanup: Successfully deleted snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
+      lecho "Clean up: Successfully deleted snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
     else
-      lecho "Cleanup: Could not delete snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
+      lecho "Clean up: Could not delete snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
       return 1
     fi
   fi
   }
 
-## Cleanup the image created by LXC
+## Clean up the image created by LXC
 cleanup_image () {
   check_backupdate
   if $LXC image info $LXCCONTAINER--BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
     if $LXC image delete $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
-      lecho "Cleanup: Successfully deleted copy $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
+      lecho "Clean up: Successfully deleted copy $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
     else
-      lecho "Cleanup: Could not delete snapshot $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
+      lecho "Clean up: Could not delete snapshot $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
       return 1
     fi
   fi
@@ -129,15 +145,15 @@ cleanup_published_image () {
   check_backupdate
   if [[ -f "$WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz" ]]; then
     if rm $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz; then
-      lecho "Cleanup: Successfully deleted published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
+      lecho "Clean up: Successfully deleted published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
     else
-      lecho "Cleanup: Could not delete published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
+      lecho "Clean up: Could not delete published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
       return 1
     fi
   fi
 }
 
-## Aggregated cleanup functions
+## Aggregated clean up functions
 cleanup () {
   cleanup_snapshot
   cleanup_image
