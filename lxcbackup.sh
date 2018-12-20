@@ -39,7 +39,7 @@ function help {
   echo
   echo "`basename $0` - A script to back up LXC/LXD Containers with rclone"
   echo
-  echo "Usage: `basename $0` <container-name>"
+  echo "Usage: `basename $0` -n <container-name>"
   echo
   exit 1
   }
@@ -50,7 +50,7 @@ PARAMETERS=$#
 while getopts ":nsh" PARAMETERS; do
   case $PARAMETERS in
     n) ## if command line option -c is given, we compile only ###
-      LXCCONTAINER="$1"
+      LXCCONTAINER="$2"
     ;;
     s)
       echo different virtual network capability not implemented yet
@@ -63,12 +63,10 @@ while getopts ":nsh" PARAMETERS; do
   esac
 done
 
-## User ran the script without parameters, print help
-if [ "$#" -ne 1 ]; then
+## User ran the script without the correct parameters, print help
+if [ "$#" -ne 2 ]; then
   help
 fi
-
-exit 0
 
 ## Clean up when exiting unclean
 trap "clean up; echo 'Unclean exit'" INT SIGHUP SIGINT SIGTERM
@@ -82,6 +80,10 @@ location=`which "$binary"`
     exit 0
   fi
 done
+
+## Define full binary paths, now we know they are installed
+RCLONE=$(which rclone)
+LXC=$(which lxc)
 
 ## Check virtual bridge file exists, and add it as command line option. The MAC
 ## & IP checks only work if the container is booted, so be aware of that too.
@@ -117,7 +119,7 @@ check_backupdate () {
 ## Clean up the LXC snapshots
 cleanup_snapshot () {
   check_backupdate
-  if $LXC info $LXCCONTAINER|grep -q $BACKUPDATE; then
+  if $LXC info $LXCCONTAINER | grep -q $BACKUPDATE; then
     if $LXC delete $LXCCONTAINER/$BACKUPDATE; then
       lecho "Clean up: Successfully deleted snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
     else
@@ -130,7 +132,7 @@ cleanup_snapshot () {
 ## Clean up the image created by LXC
 cleanup_image () {
   check_backupdate
-  if $LXC image info $LXCCONTAINER--BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
+  if $LXC image info $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
     if $LXC image delete $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
       lecho "Clean up: Successfully deleted copy $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
     else
