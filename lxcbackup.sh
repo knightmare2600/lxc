@@ -12,6 +12,9 @@
 # 19 Dec 2018  knightmare  Use current MAC & IP Address of container in backup name,    #
 #                          flesh out script, add more checks, help output, etc.         #
 # 20 Dec 2018  knightmare  Fix output, make code more modular, remove redundnat code    #
+# 29 Dec 2018  knightmare  Improve MAC/IP finding code, begin moving to arrays too      #
+# 29 Dec 2018  knightmare  Find all MACs & IPs, revert to old naming style backup names #
+#                          & clean debug code up a little. Start of backup report file  #
 #                                                                                       #
 #---------------------------------------------------------------------------------------#
 #                        How to restore MAC Address & IP Address                        #
@@ -24,6 +27,8 @@
 # lxduser@lxd:~$ lxc start restoredvmname                                               #
 #---------------------------------------------------------------------------------------#
 
+## TODO: Write a little job file or such with all the network/MACs etc based on backup file name
+
 ## Settings
 ## The target bucket or container in your Rclone cloudstorage
 RCLONETARGETDIR="lxdbackups"
@@ -33,6 +38,72 @@ RCLONEOPTIONS=""
 RCLONETARGET="backuphosting"
 ## Directory were local images are stored before upload
 WORKDIR="/tmp/lxdbackup"
+## Default behaviour
+BACKUPDATE=$(date +"%Y-%m-%d_%H-%M")
+
+
+## Functions - used by script
+lecho () {
+  # log output to syslog
+  logger "lxdbackup: $LXCCONTAINER - $@"
+  echo "lxcbackup: $LXCCONTAINER - $@" >> /tmp/$BACKUPREPORT
+  echo $@
+  }
+
+## Checking backupdate
+check_backupdate () {
+  if [ -z "$BACKUPDATE" ]; then
+    lecho "Could not determine backup date: $BACKUPDATE"
+    return 1
+  fi
+  }
+
+## Clean up the LXC snapshots
+cleanup_snapshot () {
+  check_backupdate
+  if $LXC info $LXCCONTAINER | grep -q $BACKUPDATE; then
+    if $LXC delete $LXCCONTAINER/$BACKUPDATE; then
+      lecho "Clean up: Successfully deleted snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
+    else
+      lecho "Clean up: Could not delete snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
+      return 1
+    fi
+  fi
+  }
+
+## Clean up the image created by LXC
+cleanup_image () {
+  check_backupdate
+  if $LXC image info $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE; then
+    if $LXC image delete $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE; then
+      lecho "Clean up: Successfully deleted copy $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE"
+    else
+      lecho "Clean up: Could not delete snapshot $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE"
+      return 1
+    fi
+  fi
+}
+
+## Delete the published image from the local backupstore.
+cleanup_published_image () {
+  check_backupdate
+  if [[ -f "$WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz" ]]; then
+    if rm "$WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"; then
+      lecho "Clean up: Successfully deleted published image $WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"
+    else
+      lecho "Clean up: Could not delete published image $WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"
+      return 1
+    fi
+  fi
+}
+
+## Aggregated clean up functions
+cleanup () {
+  cleanup_snapshot
+  cleanup_image
+  cleanup_published_image
+  rm "/tmp/$BACKUPREPORT"
+  }
 
 ## Help function
 function help {
@@ -72,95 +143,49 @@ fi
 trap "clean up; echo 'Unclean exit'" INT SIGHUP SIGINT SIGTERM
 
 ## Pre-flight checks. If the binaries don't exist, we're not backing anything up
-for binary in date logger lxc rclone; do
+for binary in date logger lxc mktemp rclone; do
 location=`which "$binary"`
   if [ "$?" -eq 1 ]; then
-    echo "Error: $binary command not found in path... cannot proceed"
+    lecho "Error: $binary command not found in path... cannot proceed"
     echo
     exit 0
   fi
 done
 
+## Report Name - suffix standing for (L)XC (B)ackup (M)etadata
+BACKUPREPORT="$LXCCONTAINER"-$(date +"%Y-%m-%d_%H-%M").lbm
+echo "Report name is $BACKUPREPORT"
+
 ## Define full binary paths, now we know they are installed
 RCLONE=$(which rclone)
 LXC=$(which lxc)
 
-## Check virtual bridge file exists, and add it as command line option. The MAC
-## & IP checks only work if the container is booted, so be aware of that too.
-if [ ! -f /var/lib/lxd/networks/lxdbr0/dnsmasq.leases ]; then
-  echo 'virtual bridge file /var/lib/lxd/networks/lxdbr0/dnsmasq.leases does not exist, cannot determine MAC or IP Address'
-  lecho 'virtual bridge file /var/lib/lxd/networks/lxdbr0/dnsmasq.leases does not exist, cannot determine MAC or IP Address'
-  exit 0
-fi
+## Place all the bridges into an array, so we can call them later on to find IPs/MACs
+## TODO: Print the bridges the nic was connected to in the report
+bridges=( $("$LXC" network list | awk '{ print $2 }' | sed s/^NAME//g |sort -u | sed 1,1d) )
+numbridges=${#bridges[@]}
 
-## Default behaviour
-BACKUPDATE=$(date +"%Y-%m-%d_%H-%M")
-CURRENTMAC=$(grep "$LXCCONTAINER" /var/lib/lxd/networks/lxdbr0/dnsmasq.leases | awk '{ print $2 }' | tr ':' '-')
-CURRENTIP=$(grep "$LXCCONTAINER" /var/lib/lxd/networks/lxdbr0/dnsmasq.leases | awk '{ print $3 }' | tr '.' '_')
+connectednics=0
+## To run commands on said array
+for bridge in "${bridges[@]}"
+do
+  ## Now find the named VM in the configs
+  connectednics=( $("$LXC" network show "${bridge}" | grep "$LXCCONTAINER" | wc -l) )
+done
 
-## Debug output
-##echo Container "$1" with MAC: "$CURRENTMAC" is currently on IP address: "$CURRENTIP"
+## Interface numbers start at 0 so we make sure if $NUMNICS - 1 matches, then we're done
+TOTALNICS=$("$LXC" info "$LXCCONTAINER" | grep eth | awk '{ print $1 }' | tr -d ':' | sort -u | wc -l)
+currentnic=0
 
-## Functions
-lecho () {
-  # log output to syslog
-  logger "lxdbackup: $LXCCONTAINER - $@"
-  echo $@
-  }
-
-## Checking backupdate
-check_backupdate () {
-  if [ -z "$BACKUPDATE" ]; then
-    lecho "Could not determine backup date: $BACKUPDATE"
-    return 1
-  fi
-  }
-
-## Clean up the LXC snapshots
-cleanup_snapshot () {
-  check_backupdate
-  if $LXC info $LXCCONTAINER | grep -q $BACKUPDATE; then
-    if $LXC delete $LXCCONTAINER/$BACKUPDATE; then
-      lecho "Clean up: Successfully deleted snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
-    else
-      lecho "Clean up: Could not delete snapshot $LXCCONTAINER/$BACKUPDATE - $OUTPUT"
-      return 1
-    fi
-  fi
-  }
-
-## Clean up the image created by LXC
-cleanup_image () {
-  check_backupdate
-  if $LXC image info $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
-    if $LXC image delete $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
-      lecho "Clean up: Successfully deleted copy $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
-    else
-      lecho "Clean up: Could not delete snapshot $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
-      return 1
-    fi
-  fi
-}
-
-## Delete the published image from the local backupstore.
-cleanup_published_image () {
-  check_backupdate
-  if [[ -f "$WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz" ]]; then
-    if rm $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz; then
-      lecho "Clean up: Successfully deleted published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
-    else
-      lecho "Clean up: Could not delete published image $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
-      return 1
-    fi
-  fi
-}
-
-## Aggregated clean up functions
-cleanup () {
-  cleanup_snapshot
-  cleanup_image
-  cleanup_published_image
-  }
+while [ "$currentnic" -lt "$TOTALNICS" ]
+do
+  ## Use two arrays to keep track of MACs and IPs
+  MAC=$("$LXC" config show $LXCCONTAINER | grep volatile.eth"$currentnic".hwaddr | awk '{ print $2 }')
+  ## -P means use perl mode for grep since grep still doesn't handle \t as a thing
+  IP=$("$LXC" info $LXCCONTAINER | grep -P "eth$currentnic:\tinet\t" | awk '{ print $3 }')
+  lecho "$LXCCONTAINER Network interface eth"$currentnic" on $MAC" using IP "$IP"
+  ((currentnic++))
+done
 
 ## Main backup script
 main () {
@@ -189,44 +214,56 @@ main () {
   fi
 
   ## lxc publish --force container-name-backup-date --alias webserver-backup-date
-  if $LXC publish --force $LXCCONTAINER/$BACKUPDATE --alias $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
-    lecho "Publish: Successfully published an image of $LXCCONTAINER-BACKUP-$BACKUPDATE to $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
+  if $LXC publish --force $LXCCONTAINER/$BACKUPDATE --alias $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE; then
+    lecho "Publish: Successfully published an image of $LXCCONTAINER-BACKUP-$BACKUPDATE to $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE"
   else
-    lecho "Publish: Could not create image from $LXCCONTAINER-BACKUP-$BACKUPDATE to $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE"
+    lecho "Publish: Could not create image from $LXCCONTAINER-BACKUP-$BACKUPDATE to $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE"
     cleanup
     return 1
   fi
 
 ## Export lxc image to image.tar.gz file.
-if $LXC image export $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE; then
-  lecho "Image: Successfully exported an image of $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE to $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
+if $LXC image export $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE; then
+  lecho "Image: Successfully exported an image of $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE to $WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"
 else
-  lecho "Image: Could not publish image from $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE to $WORKDIR/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
+  lecho "Image: Could not publish image from $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE to $WORKDIR/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"
   cleanup
   exit 1
 fi
 
-  ## Create the cloudstore backup if does not exist.
-  if $RCLONE mkdir $RCLONETARGET:$RCLONETARGETDIR; then
-    lecho "Target directory: Successfully created the $RCLONETARGET:$RCLONETARGETDIR directory"
-  else
-    lecho "Target directory: Could not create the $RCLONETARGET:$RCLONETARGETDIR directory"
-    cleanup
-    return 1
-  fi
+## Create the cloudstore backup if does not exist.
+if $RCLONE mkdir $RCLONETARGET:$RCLONETARGETDIR; then
+  lecho "Target directory: Successfully created the $RCLONETARGET:$RCLONETARGETDIR directory"
+else
+  lecho "Target directory: Could not create the $RCLONETARGET:$RCLONETARGETDIR directory"
+  cleanup
+  return 1
+fi
 
-  ## Upload the container image to the cloudstore backup.
-  ## TODO: this can flub and still think it executed OK. Troubleshoot
-  if $RCLONE $RCLONEOPTIONS copy $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/; then
-    lecho "Upload: Successfully uploaded $LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz image to $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz"
-    cleanup
-    lecho "Upload: Backup $BACKUPDATE for $LXCCONTAINER uploaded successfully to $RCLONETARGET."
-  else
-    lecho "Could not create the $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/$LXCCONTAINER-BACKUP-$CURRENTMAC-$CURRENTIP-$BACKUPDATE-IMAGE.tar.gz on $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/"
-    cleanup
-    return 1
-  fi
-  }
+## Upload the container image to the cloudstore backup.
+## TODO: this can flub and still think it executed OK. Troubleshoot
+if $RCLONE $RCLONEOPTIONS copy $LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/; then
+  lecho "Upload: Successfully uploaded $LXCCONTAINER-BACKUP-BACKUPDATE-IMAGE.tar.gz image to $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz"
+  cleanup
+  lecho "Upload: Backup $BACKUPDATE for $LXCCONTAINER uploaded successfully to $RCLONETARGET."
+else
+  lecho "Could not create the $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/$LXCCONTAINER-BACKUP-$BACKUPDATE-IMAGE.tar.gz on $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/"
+  cleanup
+  return 1
+ fi
+
+## Upload the backup report to the cloudstore backup.
+if $RCLONE $RCLONEOPTIONS copy /tmp/$BACKUPREPORT $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/; then
+  lecho "Upload: Successfully uploaded $BACKUPREPORT to $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/$BACKUPREPORT"
+  cleanup
+  lecho "Upload: Backup $BACKUPDATE for $LXCCONTAINER uploaded successfully to $RCLONETARGET."
+else
+  lecho "Could not create the $RCLONETARGET:$RCLONETARGETDIR/$BACKUPREPORT on $RCLONETARGET:$RCLONETARGETDIR/$LXCCONTAINER/"
+  cleanup
+  return 1
+fi
+
+}
 
 main
 exit $?
