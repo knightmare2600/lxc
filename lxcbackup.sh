@@ -128,6 +128,7 @@ while getopts ":nsh" PARAMETERS; do
       exit 0
     ;;
     *) ## any other parameters will always display help
+       lecho "Incorrect invocation of script. Please check manually"
        help
        exit 0
     ;;
@@ -137,7 +138,11 @@ done
 ## User ran the script without the correct parameters, print help
 if [ "$#" -ne 2 ]; then
   help
+  lecho "Incorrect invocation of script. Please check manually"
 fi
+
+## Print a stat of job run line to logger with job name start of input from lecho
+lecho "----------{ LXC Backup Script: Begin Execution }----------"
 
 ## Clean up when exiting unclean
 trap "clean up; echo 'Unclean exit'" INT SIGHUP SIGINT SIGTERM
@@ -262,6 +267,9 @@ else
   cleanup
   return 1
 fi
+
+## Print an end of job run line to logger with job name start of input from lecho
+lecho "----------{ LXC Backup Script: Finish Execution }----------"
 
 }
 
